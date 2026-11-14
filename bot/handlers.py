@@ -7,7 +7,7 @@ from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from parser.schedule import get_month_schedule
-from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence
+from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence, get_month_absence_hours
 from config import WEB_APP_URL, ADMIN_USER_ID
 
 router = Router()
@@ -222,19 +222,37 @@ async def process_web_app_data(message: Message):
     records = data.get("absences", [])
     if records:
         saved = 0
+        skipped = 0
         subjects = []
         for item in records:
-            await add_absence(
+            inserted = await add_absence(
                 user_id=user_id,
                 pair_number=item["pair_number"],
                 subject=item["subject"],
                 date=item.get("date")
             )
-            saved += 1
-            subjects.append(f"{item['pair_number']} пара — {item['subject']}")
+            if inserted:
+                saved += 1
+                subjects.append(f"{item['pair_number']} пара — {item['subject']}")
+            else:
+                skipped += 1
 
         lines = "\n".join(f"• {s}" for s in subjects)
-        response_text = f"✅ Сохранено пропусков: {saved}\n{lines}"
+        response_text = f"✅ Сохранено пропусков: {saved}"
+        if skipped > 0:
+            response_text += f"\n⚠️ Пропущено дубликатов: {skipped}"
+        response_text += f"\n{lines}"
+
+        # Проверка на превышение 30 часов за текущий месяц
+        from datetime import date as dt_date
+        today = dt_date.today()
+        month_hours = await get_month_absence_hours(user_id, today.year, today.month)
+        if month_hours >= 30:
+            response_text += (
+                f"\n\n⚠️ <b>Внимание!</b> У вас уже <b>{month_hours} часов</b> пропусков "
+                f"за этот месяц. Это больше 30 часов — возможен выговор. "
+                f"Не забудьте написать объяснительные и постарайтесь чаще посещать занятия."
+            )
 
     if response_text is None:
         return

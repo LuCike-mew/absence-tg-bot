@@ -67,21 +67,38 @@ async def cleanup_old_absences():
         await db.commit()
 
 
-async def add_absence(user_id: int, pair_number: int, subject: str, date: str = None, reason: str = "Не указана"):
-    """Записывает пропуск пользователя в БД. При включённом шифровании поля шифруются."""
+async def add_absence(user_id: int, pair_number: int, subject: str, date: str = None, reason: str = "Не указана") -> bool:
+    """
+    Записывает пропуск пользователя в БД. При включённом шифровании поля шифруются.
+
+    Возвращает False, если такой пропуск (user_id + date + pair_number) уже существует.
+    Возвращает True, если запись добавлена.
+    """
     target_date = date or datetime.now().strftime("%Y-%m-%d")
 
+    # Проверка на дубликат: получаем все пропуски, расшифровываем, сравниваем
+    existing = await get_user_absences(user_id)
+    for rec in existing:
+        # rec: (id, date, pair_number, subject, reason)
+        if rec[1] == target_date and rec[2] == pair_number:
+            return False  # дубликат — не вставляем
+
     if is_encryption_enabled():
-        target_date = encrypt(target_date)
-        subject = encrypt(subject)
-        reason = encrypt(reason)
+        enc_date = encrypt(target_date)
+        enc_subject = encrypt(subject)
+        enc_reason = encrypt(reason)
+    else:
+        enc_date = target_date
+        enc_subject = subject
+        enc_reason = reason
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO absences (user_id, date, pair_number, subject, reason)
             VALUES (?, ?, ?, ?, ?)
-        """, (user_id, target_date, pair_number, subject, reason))
+        """, (user_id, enc_date, pair_number, enc_subject, enc_reason))
         await db.commit()
+    return True
 
 
 async def get_user_absences(user_id: int) -> list[tuple]:
@@ -116,6 +133,24 @@ async def get_user_absences(user_id: int) -> list[tuple]:
             decrypted.append(row)
 
     return decrypted
+
+
+async def get_month_absence_hours(user_id: int, year: int, month: int) -> int:
+    """
+    Возвращает количество часов пропусков за указанный месяц.
+    Каждый пропуск = 2 академических часа.
+    """
+    all_absences = await get_user_absences(user_id)
+    count = 0
+    for rec in all_absences:
+        # rec: (id, date, pair_number, subject, reason)
+        try:
+            d = datetime.strptime(rec[1], "%Y-%m-%d").date()
+            if d.year == year and d.month == month:
+                count += 1
+        except (ValueError, TypeError):
+            pass
+    return count * 2
 
 
 async def delete_absence(absence_id: int, user_id: int) -> bool:
