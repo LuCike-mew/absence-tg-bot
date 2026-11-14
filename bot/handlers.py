@@ -196,6 +196,7 @@ async def process_web_app_data(message: Message):
         return
 
     user_id = message.from_user.id
+    response_text = None
 
     # ── Обработка удалений ──────────────────────────────────────────────
     deletions = data.get("deletions", [])
@@ -209,17 +210,11 @@ async def process_web_app_data(message: Message):
             if success:
                 deleted_count += 1
 
-        await message.answer(
-            f"🗑 Удалено пропусков: {deleted_count}",
-            parse_mode="HTML"
-        )
+        response_text = f"🗑 Удалено пропусков: {deleted_count}"
 
     # ── Обработка сохранения пропусков ──────────────────────────────────
     records = data.get("absences", [])
-    if not records:
-        if not deletions:
-            return
-    else:
+    if records:
         saved = 0
         subjects = []
         for item in records:
@@ -232,19 +227,28 @@ async def process_web_app_data(message: Message):
             saved += 1
             subjects.append(f"{item['pair_number']} пара — {item['subject']}")
 
-        # Подтверждение пользователю
         lines = "\n".join(f"• {s}" for s in subjects)
-        await message.answer(
-            f"✅ Сохранено пропусков: {saved}\n{lines}",
-            parse_mode="HTML"
-        )
+        response_text = f"✅ Сохранено пропусков: {saved}\n{lines}"
 
-    # Обновление URL в главной кнопке меню для следующего открытия
+    if response_text is None:
+        return
+
+    # Формируем свежий URL и обновляем обе кнопки одним сообщением
     new_url = await get_dynamic_webapp_url(user_id)
     await message.bot.set_chat_menu_button(
         chat_id=message.chat.id,
         menu_button=MenuButtonWebApp(
             text="Открыть приложение",
             web_app=WebAppInfo(url=new_url)
+        )
+    )
+    await message.answer(
+        response_text,
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Отметить пропуски", web_app=WebAppInfo(url=new_url))]
+            ],
+            resize_keyboard=True
         )
     )
