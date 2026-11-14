@@ -6,6 +6,7 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN
 from database.db import init_db
 from bot.handlers import router
+from parser.schedule import refresh_schedule_cache
 
 # Принудительно переводим stdout/stderr в UTF-8. Иначе при запуске из exe
 # (пайп с GUI-панелью) кириллица в логах кодируется в cp1251, а читающая
@@ -49,11 +50,28 @@ async def set_bot_profile(bot: Bot):
     await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
 
 
+async def schedule_refresh_loop():
+    """Фоновый цикл: раз в час обновляет кэш расписания с сайта колледжа."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            await refresh_schedule_cache()
+        except Exception:
+            logging.exception("Ошибка фонового обновления расписания")
+
+
 async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Первичное заполнение кэша расписания
+    logging.info("Первичная загрузка расписания…")
+    await refresh_schedule_cache()
+
+    # Запускаем фоновый цикл обновления
+    asyncio.create_task(schedule_refresh_loop())
 
     # Настройка кнопки Меню и профиля бота перед стартом опроса
     await set_main_menu(bot)

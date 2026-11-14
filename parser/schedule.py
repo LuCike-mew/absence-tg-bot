@@ -11,6 +11,7 @@
 import io
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from urllib.parse import urljoin
@@ -758,3 +759,39 @@ async def get_month_schedule(group_name: str = GROUP_NAME) -> list:
     """
     month_dates = _month_dates()
     return await get_schedule_for_range(month_dates[0], month_dates[-1], group_name)
+
+
+# ── кэш расписания (обновляется фоновой задачей) ────────────────────────────
+
+#: За кэшированное расписание месяца (результат get_month_schedule).
+_cached_schedule: list | None = None
+#: Время последнего обновления кэша (time.time()).
+_cache_timestamp: float = 0
+#: Время жизни кэша в секундах (1 час).
+_CACHE_TTL: float = 3600
+
+
+async def get_cached_month_schedule(group_name: str = GROUP_NAME) -> list:
+    """
+    Возвращает расписание месяца из кэша, если он свежий.
+    При первом вызове или истечении TTL — обновляет кэш.
+    """
+    if _cached_schedule is not None and (time.time() - _cache_timestamp) < _CACHE_TTL:
+        return _cached_schedule
+    return await refresh_schedule_cache(group_name)
+
+
+async def refresh_schedule_cache(group_name: str = GROUP_NAME) -> list:
+    """
+    Принудительно обновляет кэш расписания.
+
+    Вызывается:
+    - при первом старте бота (main.py);
+    - фоновой задачей каждый час;
+    - автоматически из get_cached_month_schedule при истечении TTL.
+    """
+    global _cached_schedule, _cache_timestamp
+    _cached_schedule = await get_month_schedule(group_name)
+    _cache_timestamp = time.time()
+    logging.info("Кэш расписания обновлён (%d дней)", len(_cached_schedule))
+    return _cached_schedule

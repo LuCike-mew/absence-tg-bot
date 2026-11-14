@@ -6,7 +6,7 @@ import urllib.parse
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
-from parser.schedule import get_month_schedule
+from parser.schedule import get_cached_month_schedule
 from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence, get_month_absence_hours
 from config import WEB_APP_URL, ADMIN_USER_ID
 
@@ -34,7 +34,7 @@ def compress_history(history_records: list[tuple]) -> str:
 async def get_dynamic_webapp_url(user_id: int) -> str:
     """Формирует URL со сжатым расписанием и историей."""
     from datetime import date
-    month_schedule = await get_month_schedule()
+    month_schedule = await get_cached_month_schedule()
     history_records = await get_user_absences(user_id)
 
     # Первое число месяца — чтобы WebApp знал границу навигации
@@ -85,7 +85,9 @@ async def cmd_start(message: Message):
         "1️⃣ Нажмите кнопку <b>«Отметить пропуски»</b> под чатом.\n"
         "2️⃣ Выберите пары, на которых вас не будет.\n"
         "3️⃣ Нажмите «Сохранить пропуски» внутри приложения.\n\n"
-        "Готово — пропуск появится в вашей истории. Начните с кнопки ниже 👇",
+        "Готово — пропуск появится в вашей истории. Начните с кнопки ниже 👇\n\n"
+        "<i>⏳ Бот может отвечать с задержкой в несколько секунд — "
+        "он подгружает свежее расписание прямо с сайта колледжа.</i>",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
@@ -108,6 +110,8 @@ async def cmd_about(message: Message):
         "<b>Разработка и реализация:</b> @LuCike_mew\n"
         "<b>Вдохновитель и соавтор:</b> @a_korop (за оригинальную концепцию парсинга расписания)\n\n"
         "<b>Исходный код:</b> <a href=\"https://github.com/LuCike-mew/absence-tg-bot\">github.com/LuCike-mew/absence-tg-bot</a>\n\n"
+        "<i>⏳ Бот подгружает расписание с сайта колледжа каждые 60 минут — "
+        "при первом запуске или после долгого перерыва ответ может занять несколько секунд.</i>\n\n"
         "Проект распространяется бесплатно для студентов группы ВЕБ-42."
     )
     await message.answer(about_text, parse_mode="HTML")
