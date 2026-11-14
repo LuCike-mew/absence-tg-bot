@@ -37,6 +37,8 @@ async def set_main_menu(bot: Bot):
     main_menu_commands = [
         BotCommand(command="/start", description="Запустить бота и открыть приложение"),
         BotCommand(command="/about", description="О проекте и авторах"),
+        BotCommand(command="/broadcast", description="Рассылка сообщений (только админ)"),
+        BotCommand(command="/stats", description="Статистика бота (только админ)"),
     ]
     await bot.set_my_commands(main_menu_commands)
 

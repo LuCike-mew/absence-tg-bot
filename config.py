@@ -52,3 +52,37 @@ WEB_APP_URL = os.getenv("WEB_APP_URL", "https://lucike-mew.github.io/absence-web
 # True  — использовать тестовые моки (не ходит в сеть)
 # False — реальный парсинг с сайта колледжа
 USE_MOCK_SCHEDULE = os.getenv("USE_MOCK_SCHEDULE", "false").lower() in ("1", "true", "yes")
+
+# Telegram user ID администратора, которому доступна команда /broadcast
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+
+def _ensure_encryption_key() -> None:
+    """Автоматически генерирует и сохраняет ENCRYPTION_KEY, если его нет.
+
+    Ключ нужен для шифрования данных в БД. Если ключ отсутствует — шифрование
+    не работает и данные хранятся открыто. При первом запуске ключ создаётся
+    автоматически и записывается в .env.
+    """
+    if os.getenv("ENCRYPTION_KEY"):
+        return  # ключ уже есть
+
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        return  # cryptography не установлен — шифрование не будет работать
+
+    env_path = os.path.join(BASE_DIR, ".env")
+    key = Fernet.generate_key().decode("utf-8")
+
+    # Дописываем ключ в .env
+    try:
+        with open(env_path, "a", encoding="utf-8") as f:
+            f.write(f"\n# Auto-generated encryption key for database privacy\n")
+            f.write(f"ENCRYPTION_KEY={key}\n")
+        os.environ["ENCRYPTION_KEY"] = key
+    except OSError:
+        pass  # не удалось записать — шифрование не включится
+
+
+_ensure_encryption_key()

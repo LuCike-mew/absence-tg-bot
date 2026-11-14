@@ -7,8 +7,8 @@ from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from parser.schedule import get_full_week_schedule
-from database.db import add_absence, get_user_absences
-from config import WEB_APP_URL
+from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence
+from config import WEB_APP_URL, ADMIN_USER_ID
 
 router = Router()
 
@@ -24,8 +24,9 @@ def compress_history(history_records: list[tuple]) -> str:
     if not history_records:
         return ""
 
-    # Формат строк: YYYY-MM-DD|номер_пары|Предмет
-    raw_lines = [f"{rec[0]}|{rec[1]}|{rec[2]}" for rec in history_records]
+    # Формат строк: ID|YYYY-MM-DD|номер_пары|Предмет
+    # rec: (id, date, pair_number, subject, reason)
+    raw_lines = [f"{rec[0]}|{rec[1]}|{rec[2]}|{rec[3]}" for rec in history_records]
     text_data = "\n".join(raw_lines)
     return _gzip_b64(text_data)
 
@@ -42,7 +43,7 @@ async def get_dynamic_webapp_url(user_id: int) -> str:
     encoded_week = urllib.parse.quote(compressed_week)
     encoded_history = urllib.parse.quote(compressed_history) if compressed_history else ""
 
-    return f"{WEB_APP_URL}?v=11&week={encoded_week}&h={encoded_history}"
+    return f"{WEB_APP_URL}?v=12&week={encoded_week}&h={encoded_history}"
 
 
 @router.message(CommandStart())
@@ -50,6 +51,9 @@ async def cmd_start(message: Message):
     """Настраивает кнопку вызова Web App в меню и клавиатуре."""
     user_id = message.from_user.id
     target_url = await get_dynamic_webapp_url(user_id)
+
+    # Регистрируем пользователя для будущих рассылок
+    await register_user(user_id)
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -103,9 +107,85 @@ async def cmd_about(message: Message):
     await message.answer(about_text, parse_mode="HTML")
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Показывает количество зарегистрированных пользователей (только для админа)."""
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    all_users = await get_all_user_ids()
+    total = len(all_users)
+
+    await message.answer(
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{total}</b>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """Рассылает сообщение всем пользователям бота (только для админа)."""
+    user_id = message.from_user.id
+
+    if user_id != ADMIN_USER_ID:
+        await message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    # Извлекаем текст после команды
+    text = message.text or ""
+    # Удаляем команду /broadcast и возможное упоминание бота
+    if text.startswith("/broadcast"):
+        text = text[len("/broadcast"):].strip()
+        # Если команда написана как /broadcast@bot_username — обрабатываем и этот случай
+        if text.startswith("@"):
+            space_idx = text.find(" ")
+            if space_idx != -1:
+                text = text[space_idx:].strip()
+            else:
+                text = ""
+
+    if not text:
+        await message.answer(
+            "📝 <b>Использование:</b>\n"
+            "<code>/broadcast ваше сообщение</code>\n\n"
+            "Сообщение будет отправлено всем пользователям бота.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Получаем всех пользователей
+    all_users = await get_all_user_ids()
+    total = len(all_users)
+
+    if total == 0:
+        await message.answer("📭 Нет зарегистрированных пользователей для рассылки.")
+        return
+
+    # Отправляем сообщение каждому пользователю
+    sent = 0
+    failed = 0
+    for uid in all_users:
+        try:
+            await message.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    # Отчёт админу
+    await message.answer(
+        f"📊 <b>Рассылка завершена</b>\n\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Не удалось: {failed}\n"
+        f"👥 Всего пользователей: {total}",
+        parse_mode="HTML"
+    )
+
+
 @router.message(F.web_app_data)
 async def process_web_app_data(message: Message):
-    """Принимает пропуски от Web App, пишет их в БД и подтверждает пользователю."""
+    """Принимает данные от Web App: сохранение пропусков или их удаление."""
     raw_data = message.web_app_data.data
 
     try:
@@ -115,31 +195,52 @@ async def process_web_app_data(message: Message):
         await message.answer("⚠️ Не удалось разобрать данные, попробуйте ещё раз.")
         return
 
+    user_id = message.from_user.id
+
+    # ── Обработка удалений ──────────────────────────────────────────────
+    deletions = data.get("deletions", [])
+    if deletions:
+        deleted_count = 0
+        for item in deletions:
+            success = await delete_absence(
+                absence_id=item["id"],
+                user_id=user_id
+            )
+            if success:
+                deleted_count += 1
+
+        await message.answer(
+            f"🗑 Удалено пропусков: {deleted_count}",
+            parse_mode="HTML"
+        )
+
+    # ── Обработка сохранения пропусков ──────────────────────────────────
     records = data.get("absences", [])
     if not records:
-        return
+        if not deletions:
+            return
+    else:
+        saved = 0
+        subjects = []
+        for item in records:
+            await add_absence(
+                user_id=user_id,
+                pair_number=item["pair_number"],
+                subject=item["subject"],
+                date=item.get("date")
+            )
+            saved += 1
+            subjects.append(f"{item['pair_number']} пара — {item['subject']}")
 
-    saved = 0
-    subjects = []
-    for item in records:
-        await add_absence(
-            user_id=message.from_user.id,
-            pair_number=item["pair_number"],
-            subject=item["subject"],
-            date=item.get("date")
+        # Подтверждение пользователю
+        lines = "\n".join(f"• {s}" for s in subjects)
+        await message.answer(
+            f"✅ Сохранено пропусков: {saved}\n{lines}",
+            parse_mode="HTML"
         )
-        saved += 1
-        subjects.append(f"{item['pair_number']} пара — {item['subject']}")
-
-    # Подтверждение пользователю
-    lines = "\n".join(f"• {s}" for s in subjects)
-    await message.answer(
-        f"✅ Сохранено пропусков: {saved}\n{lines}",
-        parse_mode="HTML"
-    )
 
     # Обновление URL в главной кнопке меню для следующего открытия
-    new_url = await get_dynamic_webapp_url(message.from_user.id)
+    new_url = await get_dynamic_webapp_url(user_id)
     await message.bot.set_chat_menu_button(
         chat_id=message.chat.id,
         menu_button=MenuButtonWebApp(
