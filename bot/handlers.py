@@ -6,7 +6,7 @@ import urllib.parse
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
-from parser.schedule import get_full_week_schedule
+from parser.schedule import get_full_week_schedule, get_month_schedule
 from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence
 from config import WEB_APP_URL, ADMIN_USER_ID
 
@@ -33,17 +33,23 @@ def compress_history(history_records: list[tuple]) -> str:
 
 async def get_dynamic_webapp_url(user_id: int) -> str:
     """Формирует URL со сжатым расписанием и историей."""
-    week_schedule = await get_full_week_schedule()
+    from datetime import date
+    month_schedule = await get_month_schedule()
     history_records = await get_user_absences(user_id)
 
+    # Первое число месяца — чтобы WebApp знал границу навигации
+    today = date.today()
+    month_start = date(today.year, today.month, 1).isoformat()
+
     # Сжимаем оба параметра, чтобы влезть в лимит Telegram WebApp URL
-    compressed_week = _gzip_b64(json.dumps(week_schedule, ensure_ascii=False))
+    compressed_week = _gzip_b64(json.dumps(month_schedule, ensure_ascii=False))
     compressed_history = compress_history(history_records)
 
     encoded_week = urllib.parse.quote(compressed_week)
     encoded_history = urllib.parse.quote(compressed_history) if compressed_history else ""
+    encoded_month_start = urllib.parse.quote(month_start)
 
-    return f"{WEB_APP_URL}?v=12&week={encoded_week}&h={encoded_history}"
+    return f"{WEB_APP_URL}?v=13&week={encoded_week}&h={encoded_history}&ms={encoded_month_start}"
 
 
 @router.message(CommandStart())

@@ -521,6 +521,25 @@ def _current_week_dates() -> list[date]:
     return [monday + timedelta(days=i) for i in range(6)]
 
 
+def _month_dates() -> list[date]:
+    """
+    Возвращает даты с 1-го числа текущего месяца по субботу текущей недели.
+
+    Нужно, чтобы пользователь мог отмечать пропуски за прошлые даты текущего
+    месяца (но не раньше 1-го числа).
+    """
+    today = date.today()
+    start = date(today.year, today.month, 1)
+    monday = today - timedelta(days=today.weekday())
+    end = monday + timedelta(days=5)  # суббота текущей недели
+    result: list[date] = []
+    current = start
+    while current <= end:
+        result.append(current)
+        current += timedelta(days=1)
+    return result
+
+
 def build_replacement_candidate_urls(day: date) -> list[str]:
     """
     Строит возможные URL PDF-замен для конкретной даты.
@@ -563,19 +582,26 @@ async def get_replacement_urls() -> list[str]:
     return urls
 
 
-async def get_replacements_for_group(group_name: str = GROUP_NAME) -> dict:
+async def get_replacements_for_group(
+    dates: list[date] | None = None,
+    group_name: str = GROUP_NAME,
+) -> dict:
     """
     Загружает и разбирает PDF-замены для группы.
 
+    Если dates не передан — используется текущая неделя (_current_week_dates).
     Возвращает {date_key (ISO): {номер_пары: {"teacher", "room"}}}.
     Пустой словарь, если замен нет или файлы недоступны.
 
     Источники ссылок:
     1. Страница расписания (актуальные PDF «ZAMENY-…»).
-    2. Резерв: URL по датам текущей недели («работает» в любой день/месяц).
+    2. Резерв: URL по датам из параметра dates («работает» в любой день/месяц).
     """
+    if dates is None:
+        dates = _current_week_dates()
+
     urls = await get_replacement_urls()
-    for day in _current_week_dates():
+    for day in dates:
         urls.extend(build_replacement_candidate_urls(day))
 
     # Дедупликация с сохранением порядка
@@ -607,55 +633,27 @@ async def get_replacements_for_group(group_name: str = GROUP_NAME) -> dict:
 
 # ── главная точка входа ──────────────────────────────────────────────────────
 
-async def get_full_week_schedule(group_name: str = GROUP_NAME) -> list:
+
+def _build_days(
+    dates: list[date],
+    main_pairs: dict[int, dict[int, dict]],
+    replacements: dict[str, dict[int, dict]],
+) -> list:
     """
-    Загружает актуальное расписание и возвращает список дней текущей недели.
+    Строит список day-объектов для переданных дат.
 
-    Каждый элемент списка:
-        {
-            "day_name": str,      # "Понедельник" … "Суббота"
-            "date": str,          # "12.11"
-            "full_date": str,     # "2026-11-12"
-            "pairs": [
-                {"num": int, "subject": str, "room": str, "is_replacement": bool},
-                …
-            ],
-        }
+    dates — список date, main_pairs — {weekday_index: {pair_num: {subject, room, is_replacement}}},
+    replacements — {date_key (ISO): {pair_num: {teacher, room}}}.
+    Пропускает воскресенья (weekday >= 6).
     """
-    # ── Mock-режим: возвращаем тестовые данные без выхода в сеть ──────────
-    if USE_MOCK_SCHEDULE:
-        global _MOCK_SCHEDULE_CACHE
-        if _MOCK_SCHEDULE_CACHE is None:
-            _MOCK_SCHEDULE_CACHE = _build_mock_week()
-        logging.info("[MOCK] Возвращаю тестовое расписание")
-        return _MOCK_SCHEDULE_CACHE
-
-    # ── Реальный парсинг ──────────────────────────────────────────────────
-    schedule_url = await get_latest_schedule_url()
-    if not schedule_url:
-        logging.error("Не удалось получить URL расписания — возвращаю пустые данные")
-        main_pairs: dict = {day: {} for day in range(6)}
-    else:
-        file_bytes = await _fetch(schedule_url)
-        if not file_bytes:
-            logging.error("Не удалось скачать файл расписания по URL: %s", schedule_url)
-            main_pairs = {day: {} for day in range(6)}
-        else:
-            try:
-                main_pairs = parse_excel_pairs(file_bytes, group_name=group_name)
-            except Exception:
-                logging.exception("Не удалось разобрать файл расписания %s", schedule_url)
-                main_pairs = {day: {} for day in range(6)}
-
-    replacements = await get_replacements_for_group(group_name)
-    start = datetime.now().date() - timedelta(days=datetime.now().weekday())
-
     result = []
-    for i, day_name in enumerate(DAYS):
-        current = start + timedelta(days=i)
+    for current in dates:
+        if current.weekday() >= 6:  # воскресенье
+            continue
+        day_idx = current.weekday()  # 0=Пн … 5=Сб
         date_key = current.isoformat()
         day_replacements = replacements.get(date_key, {})
-        day_pairs = main_pairs.get(i, {})
+        day_pairs = main_pairs.get(day_idx, {})
 
         # Собираем все номера пар: из основного расписания + из замен
         nums = sorted(set(day_pairs) | set(day_replacements))
@@ -679,9 +677,84 @@ async def get_full_week_schedule(group_name: str = GROUP_NAME) -> list:
                 "is_replacement": is_replacement,
             })
         result.append({
-            "day_name": day_name,
+            "day_name": DAYS[day_idx],
             "date": current.strftime("%d.%m"),
             "full_date": date_key,
             "pairs": pairs,
         })
     return result
+
+
+async def get_schedule_for_range(
+    start_date: date,
+    end_date: date,
+    group_name: str = GROUP_NAME,
+) -> list:
+    """
+    Загружает актуальное расписание и возвращает список дней в диапазоне дат.
+
+    Каждый элемент списка:
+        {
+            "day_name": str,      # "Понедельник" … "Суббота"
+            "date": str,          # "12.11"
+            "full_date": str,     # "2026-11-12"
+            "pairs": [
+                {"num": int, "subject": str, "room": str, "is_replacement": bool},
+                …
+            ],
+        }
+    """
+    if USE_MOCK_SCHEDULE:
+        global _MOCK_SCHEDULE_CACHE
+        if _MOCK_SCHEDULE_CACHE is None:
+            _MOCK_SCHEDULE_CACHE = _build_mock_week()
+        logging.info("[MOCK] Возвращаю тестовое расписание")
+        return _MOCK_SCHEDULE_CACHE
+
+    # Парсинг .xls (один раз для всего диапазона)
+    schedule_url = await get_latest_schedule_url()
+    if not schedule_url:
+        logging.error("Не удалось получить URL расписания — возвращаю пустые данные")
+        main_pairs: dict = {day: {} for day in range(6)}
+    else:
+        file_bytes = await _fetch(schedule_url)
+        if not file_bytes:
+            logging.error("Не удалось скачать файл расписания по URL: %s", schedule_url)
+            main_pairs = {day: {} for day in range(6)}
+        else:
+            try:
+                main_pairs = parse_excel_pairs(file_bytes, group_name=group_name)
+            except Exception:
+                logging.exception("Не удалось разобрать файл расписания %s", schedule_url)
+                main_pairs = {day: {} for day in range(6)}
+
+    # Формируем список дат (без воскресений)
+    dates: list[date] = []
+    current = start_date
+    while current <= end_date:
+        if current.weekday() < 6:
+            dates.append(current)
+        current += timedelta(days=1)
+
+    replacements = await get_replacements_for_group(dates=dates, group_name=group_name)
+    return _build_days(dates, main_pairs, replacements)
+
+
+async def get_full_week_schedule(group_name: str = GROUP_NAME) -> list:
+    """
+    Загружает актуальное расписание и возвращает список дней текущей недели.
+    (обратная совместимость — использует get_schedule_for_range)
+    """
+    week_dates = _current_week_dates()
+    return await get_schedule_for_range(week_dates[0], week_dates[-1], group_name)
+
+
+async def get_month_schedule(group_name: str = GROUP_NAME) -> list:
+    """
+    Загружает расписание с 1-го числа текущего месяца по субботу текущей недели.
+
+    Нужно, чтобы пользователь мог отмечать пропуски за прошлые даты текущего
+    месяца (но не раньше 1-го числа). Использует get_schedule_for_range.
+    """
+    month_dates = _month_dates()
+    return await get_schedule_for_range(month_dates[0], month_dates[-1], group_name)
