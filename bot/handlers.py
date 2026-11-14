@@ -233,7 +233,11 @@ async def process_web_app_data(message: Message):
             )
             if inserted:
                 saved += 1
-                subjects.append(f"{item['pair_number']} пара — {item['subject']}")
+                # Форматируем дату: YYYY-MM-DD → DD.MM
+                date_str = item.get("date", "")
+                if len(date_str) == 10 and date_str[4] == "-":
+                    date_str = f"{date_str[8:10]}.{date_str[5:7]}"
+                subjects.append(f"{date_str} {item['pair_number']} пара — {item['subject']}")
             else:
                 skipped += 1
 
