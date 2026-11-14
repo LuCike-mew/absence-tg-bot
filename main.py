@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand
 from config import BOT_TOKEN
-from database.db import init_db
+from database.db import init_db, cleanup_old_absences
 from bot.handlers import router
 from parser.schedule import refresh_schedule_cache
 
@@ -51,9 +51,13 @@ async def set_bot_profile(bot: Bot):
 
 
 async def schedule_refresh_loop():
-    """Фоновый цикл: раз в час обновляет кэш расписания с сайта колледжа."""
+    """Фоновый цикл: раз в час обновляет кэш расписания и чистит старые пропуски в БД."""
     while True:
         await asyncio.sleep(3600)
+        try:
+            await cleanup_old_absences()
+        except Exception:
+            logging.exception("Ошибка очистки старых пропусков")
         try:
             await refresh_schedule_cache()
         except Exception:
