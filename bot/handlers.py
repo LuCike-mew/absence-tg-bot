@@ -6,7 +6,7 @@ import urllib.parse
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
-from parser.schedule import get_full_week_schedule, get_month_schedule
+from parser.schedule import get_month_schedule
 from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence
 from config import WEB_APP_URL, ADMIN_USER_ID
 
