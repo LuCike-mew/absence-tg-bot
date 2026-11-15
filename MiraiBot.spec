@@ -22,6 +22,8 @@ datas += [('icon.ico', '.')]
 hiddenimports = [
     'pypdf',
     'pystray._win32',
+    'PIL',
+    'PIL.Image',
 ]
 
 a = Analysis(

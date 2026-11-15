@@ -5,3 +5,5 @@ httpx
 xlrd
 pypdf
 cryptography
+Pillow
+pystray

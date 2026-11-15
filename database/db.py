@@ -39,6 +39,13 @@ async def init_db():
                 first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_snapshots (
+                week_start TEXT PRIMARY KEY,
+                template_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         await db.commit()
 
 
@@ -193,5 +200,48 @@ async def get_all_user_ids() -> list[int]:
     """Возвращает список всех зарегистрированных пользователей."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+# ── Снимки расписания ─────────────────────────────────────────────────────────
+# Шаблон недели (weekday_index → пары), распарсенный из .xls, сохраняется
+# под ключом «понедельник недели» (YYYY-MM-DD). Нужно, чтобы прошлые недели
+# показывали своё расписание, а не текущее (сайт хранит старые .xls, но на
+# странице видна только актуальная ссылка).
+
+
+async def save_schedule_snapshot(week_start: str, template_json: str) -> None:
+    """Сохраняет шаблон расписания недели (JSON-строку) под ключом недели."""
+    async with _db_write_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO schedule_snapshots (week_start, template_json)
+                VALUES (?, ?)
+                ON CONFLICT(week_start) DO UPDATE SET
+                    template_json = excluded.template_json,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (week_start, template_json)
+            )
+            await db.commit()
+
+
+async def get_schedule_snapshot(week_start: str) -> str | None:
+    """Возвращает сохранённый шаблон недели (JSON-строку) или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT template_json FROM schedule_snapshots WHERE week_start = ?",
+            (week_start,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def get_all_snapshot_weeks() -> list[str]:
+    """Возвращает список понедельников недель, для которых есть снимки."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT week_start FROM schedule_snapshots") as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]

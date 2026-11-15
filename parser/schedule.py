@@ -9,9 +9,11 @@
 """
 
 import io
+import json
 import logging
 import re
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from urllib.parse import urljoin
@@ -532,7 +534,10 @@ def _month_dates() -> list[date]:
     today = date.today()
     start = date(today.year, today.month, 1)
     monday = today - timedelta(days=today.weekday())
-    end = monday + timedelta(days=5)  # суббота текущей недели
+    # Понедельник СЛЕДУЮЩЕЙ недели: превью, пока расписание на неделю ещё не
+    # обновилось (замены и расписание на понедельник уже известны). Остальные
+    # дни следующей недели появятся после обновления .xls во вторник.
+    end = monday + timedelta(days=7)  # понедельник следующей недели
     result: list[date] = []
     current = start
     while current <= end:
@@ -656,6 +661,11 @@ def _build_days(
         day_replacements = replacements.get(date_key, {})
         day_pairs = main_pairs.get(day_idx, {})
 
+        # Нормализуем ключи к int: при загрузке снимка из БД (JSON round-trip)
+        # ключи словарей становятся строками, а parse_replacement_pdf
+        # возвращает int-ключи. Приводим всё к int для корректного sorted().
+        day_pairs = {int(k): v for k, v in day_pairs.items()}
+
         # Собираем все номера пар: из основного расписания + из замен
         nums = sorted(set(day_pairs) | set(day_replacements))
         pairs = []
@@ -663,19 +673,27 @@ def _build_days(
             repl_info = day_replacements.get(num)
             base = day_pairs.get(num, {})
             if repl_info is not None:
-                # Заменённая пара: показываем преподавателя-замену и аудиторию
+                # Заменённая пара: показываем преподавателя-замену и аудиторию,
+                # а оригинальную пару (предмет + кабинет) сохраняем отдельно,
+                # чтобы во фронтенде показать её перечёркнутой.
                 subject = repl_info.get("teacher") or base.get("subject", "")
                 room = repl_info.get("room") or base.get("room", "")
                 is_replacement = True
+                original_subject = base.get("subject", "")
+                original_room = base.get("room", "")
             else:
                 subject = base.get("subject", "")
                 room = base.get("room", "")
                 is_replacement = base.get("is_replacement", False)
+                original_subject = ""
+                original_room = ""
             pairs.append({
                 "num": num,
                 "subject": subject,
                 "room": room,
                 "is_replacement": is_replacement,
+                "original_subject": original_subject,
+                "original_room": original_room,
             })
         result.append({
             "day_name": DAYS[day_idx],
@@ -686,6 +704,89 @@ def _build_days(
     return result
 
 
+# ── поиск старых .xls по угадываемым URL ──────────────────────────────────
+
+
+def _governing_tuesday(d: date) -> date:
+    """
+    Управляющий вторник для даты d — последний вторник ≤ d.
+
+    Расписание выкладывается во вторник и действует с этого вторника
+    по следующий понедельник включительно.  Например, .xls от 10.11
+    покрывает даты 10.11 (вт) – 16.11 (пн).
+    """
+    return d - timedelta(days=(d.weekday() - 1) % 7)
+
+
+_URL_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+
+
+def _extract_date_from_url(url: str) -> date | None:
+    """Извлекает дату DD.MM.YYYY из URL .xls-файла."""
+    m = _URL_DATE_RE.search(url)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def _build_candidate_urls_for_date(day: date) -> list[str]:
+    """
+    Строит возможные URL .xls-файлов для заданной даты.
+
+    Конвенции имён на сайте менялись:
+    - старый стиль: DD.MM.YYYY-dlya-sajta_crd.xls  (до 03.11.2026)
+    - новый стиль:  DD.MM.YYYY_dlya_sajta.xls       (с  10.11.2026)
+
+    Возвращает список URL в порядке убывания вероятности.
+    """
+    year = f"{day.year:04d}"
+    month = f"{day.month:02d}"
+    day_str = f"{day.day:02d}.{day.month:02d}.{day.year}"
+    base = urljoin(COLLEGE_URL, "wp-content/uploads/")
+    return [
+        urljoin(base, f"{year}/{month}/{day_str}_dlya_sajta.xls"),
+        urljoin(base, f"{year}/{month}/{day_str}-dlya-sajta_crd.xls"),
+        urljoin(base, f"{year}/{month}/{day_str}_dlya_sajta.xlsx"),
+        urljoin(base, f"{year}/{month}/{day_str}-dlya-sajta_crd.xlsx"),
+    ]
+
+
+async def _try_fetch_past_schedule(
+    governing_tuesday: date,
+    group_name: str = GROUP_NAME,
+) -> dict | None:
+    """
+    Пытается найти .xls для управляющего вторника на сервере.
+
+    Возвращает распарсенный шаблон {weekday: {pair_num: ...}}
+    или None, если файл не найден.  При успехе сохраняет снимок в БД.
+    """
+    from database.db import save_schedule_snapshot
+
+    for url in _build_candidate_urls_for_date(governing_tuesday):
+        content = await _fetch(url, max_retries=0, quiet=True)
+        if not content:
+            continue
+        try:
+            template = parse_excel_pairs(content, group_name=group_name)
+            await save_schedule_snapshot(
+                governing_tuesday.isoformat(),
+                json.dumps(template, ensure_ascii=False),
+            )
+            logging.info(
+                "Найден старый .xls для периода от %s: %s",
+                governing_tuesday.isoformat(), url,
+            )
+            return template
+        except Exception:
+            logging.debug("Не удалось разобрать %s", url)
+            continue
+    return None
+
+
 async def get_schedule_for_range(
     start_date: date,
     end_date: date,
@@ -694,13 +795,26 @@ async def get_schedule_for_range(
     """
     Загружает актуальное расписание и возвращает список дней в диапазоне дат.
 
+    Расписание выкладывается во вторник и действует с этого вторника по
+    следующий понедельник включительно.  Для каждой даты определяется
+    «управляющий вторник» (последний вторник ≤ даты), и для него ищется
+    свой шаблон:
+    1. Снимок в БД (сохранённый при прошлых парсингах).
+    2. Попытка найти .xls на сервере (подходит и для будущих периодов —
+       как только файл появится на сайте, он будет найден при следующем
+       обновлении кэша).
+    3. Если это управляющий вторник актуального .xls — используем его.
+    4. Иначе — пустой шаблон (расписание неизвестно).
+
     Каждый элемент списка:
         {
             "day_name": str,      # "Понедельник" … "Суббота"
             "date": str,          # "12.11"
             "full_date": str,     # "2026-11-12"
             "pairs": [
-                {"num": int, "subject": str, "room": str, "is_replacement": bool},
+                {"num": int, "subject": str, "room": str,
+                 "is_replacement": bool, "original_subject": str,
+                 "original_room": str},
                 …
             ],
         }
@@ -712,33 +826,85 @@ async def get_schedule_for_range(
         logging.info("[MOCK] Возвращаю тестовое расписание")
         return _MOCK_SCHEDULE_CACHE
 
-    # Парсинг .xls (один раз для всего диапазона)
+    from database.db import (
+        save_schedule_snapshot as _db_save,
+        get_schedule_snapshot as _db_get,
+    )
+
+    # --- Загружаем актуальный .xls и определяем его управляющий вторник -----------
+    latest_pairs: dict = {day: {} for day in range(6)}
+    latest_tuesday: date | None = None
     schedule_url = await get_latest_schedule_url()
-    if not schedule_url:
-        logging.error("Не удалось получить URL расписания — возвращаю пустые данные")
-        main_pairs: dict = {day: {} for day in range(6)}
-    else:
+    if schedule_url:
+        latest_tuesday = _extract_date_from_url(schedule_url)
         file_bytes = await _fetch(schedule_url)
-        if not file_bytes:
-            logging.error("Не удалось скачать файл расписания по URL: %s", schedule_url)
-            main_pairs = {day: {} for day in range(6)}
-        else:
+        if file_bytes:
             try:
-                main_pairs = parse_excel_pairs(file_bytes, group_name=group_name)
+                latest_pairs = parse_excel_pairs(file_bytes, group_name=group_name)
             except Exception:
                 logging.exception("Не удалось разобрать файл расписания %s", schedule_url)
-                main_pairs = {day: {} for day in range(6)}
+        else:
+            logging.error("Не удалось скачать файл расписания по URL: %s", schedule_url)
+    else:
+        logging.error("Не удалось получить URL расписания")
 
-    # Формируем список дат (без воскресений)
-    dates: list[date] = []
+    if latest_tuesday is None:
+        # Не удалось извлечь дату из URL — fallback на сегодняшний вторник
+        latest_tuesday = _governing_tuesday(date.today())
+        logging.warning(
+            "Не удалось определить дату .xls из URL, fallback: %s",
+            latest_tuesday.isoformat(),
+        )
+
+    # Сохраняем актуальный шаблон под его управляющим вторником (upsert)
+    await _db_save(
+        latest_tuesday.isoformat(),
+        json.dumps(latest_pairs, ensure_ascii=False),
+    )
+
+    # --- Формируем список дат и группируем по управляющему вторнику ------------
+    all_dates: list[date] = []
     current = start_date
     while current <= end_date:
         if current.weekday() < 6:
-            dates.append(current)
+            all_dates.append(current)
         current += timedelta(days=1)
 
-    replacements = await get_replacements_for_group(dates=dates, group_name=group_name)
-    return _build_days(dates, main_pairs, replacements)
+    periods: dict[date, list[date]] = defaultdict(list)
+    for d in all_dates:
+        periods[_governing_tuesday(d)].append(d)
+
+    # Скачиваем замены один раз для всего диапазона
+    all_replacements = await get_replacements_for_group(
+        dates=all_dates, group_name=group_name,
+    )
+
+    # --- Для каждого управляющего вторника ищем свой шаблон -----------------
+    result: list = []
+    for tuesday in sorted(periods):
+        tuesday_str = tuesday.isoformat()
+        period_dates = periods[tuesday]
+
+        # 1. Снимок в БД?
+        snapshot_json = await _db_get(tuesday_str)
+        if snapshot_json is not None:
+            template = {int(k): v for k, v in json.loads(snapshot_json).items()}
+        elif tuesday == latest_tuesday:
+            # Это актуальный .xls — только что скачали выше
+            template = latest_pairs
+        else:
+            # Прошлый или будущий период — пытаемся найти .xls на сервере
+            template = await _try_fetch_past_schedule(tuesday, group_name)
+            if template is None:
+                # .xls для этого периода не найден — пусто
+                template = {day: {} for day in range(6)}
+
+        period_result = _build_days(period_dates, template, all_replacements)
+        result.extend(period_result)
+
+    # Сортируем по дате
+    result.sort(key=lambda d: d["full_date"])
+    return result
 
 
 async def get_full_week_schedule(group_name: str = GROUP_NAME) -> list:
@@ -752,10 +918,13 @@ async def get_full_week_schedule(group_name: str = GROUP_NAME) -> list:
 
 async def get_month_schedule(group_name: str = GROUP_NAME) -> list:
     """
-    Загружает расписание с 1-го числа текущего месяца по субботу текущей недели.
+    Загружает расписание с 1-го числа текущего месяца по понедельник следующей
+    недели.
 
     Нужно, чтобы пользователь мог отмечать пропуски за прошлые даты текущего
-    месяца (но не раньше 1-го числа). Использует get_schedule_for_range.
+    месяца (но не раньше 1-го числа), а также видел превью понедельника
+    следующей недели (когда замены уже известны, но расписание на неделю ещё
+    не обновилось). Использует get_schedule_for_range.
     """
     month_dates = _month_dates()
     return await get_schedule_for_range(month_dates[0], month_dates[-1], group_name)
