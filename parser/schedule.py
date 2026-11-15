@@ -197,6 +197,18 @@ def _find_group(text: str, group_name: str) -> int:
         idx = after
 
 
+def _is_valid_room(room: str) -> bool:
+    """
+    Проверяет, похожа ли строка на реальную аудиторию.
+    Принимает: «112», «221б», «ВЦ-4», «Ц-5», «с/з», «а/к6», «спортзал» и т.п.
+    Отбрасывает мусор: «)», «(», «-», одиночные спецсимволы.
+    """
+    if not room:
+        return False
+    # В аудитории должна быть хотя бы одна буква или цифра
+    return bool(re.search(r"[а-яёa-z0-9]", room, re.I))
+
+
 def _extract_room(text: str, group_idx: int, group_name: str) -> str:
     """
     Извлекает аудиторию из ячейки вида «ВЕБ-42   а.112» → «112».
@@ -204,7 +216,12 @@ def _extract_room(text: str, group_idx: int, group_name: str) -> str:
     """
     tail = text[group_idx + len(group_name):].strip()
     # Убираем ведущий маркер «а.» / «ауд.»
-    return re.sub(r"^[аaАA]\s*\.\s*", "", tail).strip()
+    room = re.sub(r"^[аaАA]\s*\.\s*", "", tail).strip()
+    # Дополнительно убираем ведущий маркер «ауд.» (с пробелом или без)
+    room = re.sub(r"^ауд\.?\s*", "", room, flags=re.I).strip()
+    if _is_valid_room(room):
+        return room
+    return ""
 
 
 def _looks_like_group_ref(text: str) -> bool:
@@ -464,6 +481,18 @@ def _parse_replace_tokens(tokens: list[str]) -> tuple[str, str]:
     return replacement, room
 
 
+def _is_self_study(text: str) -> bool:
+    """
+    Определяет, означает ли замена самостоятельную работу (нет аудитории,
+    пара проводится «дома»). Срабатывает на «сам.раб.», «(сам.раб.)»,
+    «самостоятельная работа», «сам. работа» и т.п.
+    """
+    if not text:
+        return False
+    t = _normalize(text)
+    return "сам.раб" in t or "самост" in t
+
+
 def parse_replacement_pdf(
     file_bytes: bytes,
     group_name: str = GROUP_NAME,
@@ -677,10 +706,16 @@ def _build_days(
                 # а оригинальную пару (предмет + кабинет) сохраняем отдельно,
                 # чтобы во фронтенде показать её перечёркнутой.
                 subject = repl_info.get("teacher") or base.get("subject", "")
-                room = repl_info.get("room") or base.get("room", "")
                 is_replacement = True
                 original_subject = base.get("subject", "")
                 original_room = base.get("room", "")
+                if _is_self_study(subject):
+                    # Сам.раб. — аудитории нет (пара проводится дома),
+                    # исходную аудиторию из расписания оставляем в original_room,
+                    # чтобы фронтенд показал её перечёркнутой.
+                    room = ""
+                else:
+                    room = repl_info.get("room") or base.get("room", "")
             else:
                 subject = base.get("subject", "")
                 room = base.get("room", "")
