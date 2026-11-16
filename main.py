@@ -64,6 +64,32 @@ async def schedule_refresh_loop():
             logging.exception("Ошибка фонового обновления расписания")
 
 
+async def start_api_server():
+    """Запускает FastAPI-сервер в фоне (если задан API_URL).
+
+    Сервер слушает на 127.0.0.1:API_PORT — Cloudflare Tunnel пробрасывает
+    его наружу. Если API_URL не задан, сервер не запускается и бот работает
+    по-старому (sendData).
+    """
+    from config import API_URL, API_PORT
+    if not API_URL:
+        logging.info("API_URL не задан — HTTP-API отключён (режим sendData).")
+        return
+
+    import uvicorn
+    from api import app as api_app
+
+    config = uvicorn.Config(
+        api_app,
+        host="127.0.0.1",
+        port=API_PORT,
+        log_level="info",
+    )
+    server = uvicorn.Server(config)
+    logging.info("Запуск HTTP-API на порту %d…", API_PORT)
+    asyncio.create_task(server.serve())
+
+
 async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN)
@@ -76,6 +102,9 @@ async def main():
 
     # Запускаем фоновый цикл обновления
     asyncio.create_task(schedule_refresh_loop())
+
+    # Запускаем HTTP-API (если настроен)
+    await start_api_server()
 
     # Настройка кнопки Меню и профиля бота перед стартом опроса
     await set_main_menu(bot)

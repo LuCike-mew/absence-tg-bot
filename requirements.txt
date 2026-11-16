@@ -7,3 +7,5 @@ pypdf
 cryptography
 Pillow
 pystray
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
