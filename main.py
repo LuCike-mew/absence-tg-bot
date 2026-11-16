@@ -50,8 +50,12 @@ async def set_bot_profile(bot: Bot):
     await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
 
 
-async def schedule_refresh_loop():
-    """Фоновый цикл: раз в час обновляет кэш расписания и чистит старые пропуски в БД."""
+async def schedule_refresh_loop(bot: Bot):
+    """Фоновый цикл: раз в час обновляет кэш, чистит пропуски и обновляет кнопки WebApp."""
+    from database.db import get_all_user_ids
+    from bot.handlers import get_dynamic_webapp_url
+    from aiogram.types import MenuButtonWebApp, WebAppInfo
+
     while True:
         await asyncio.sleep(3600)
         try:
@@ -62,6 +66,26 @@ async def schedule_refresh_loop():
             await refresh_schedule_cache()
         except Exception:
             logging.exception("Ошибка фонового обновления расписания")
+        # После обновления кэша — обновляем WebApp-кнопку у всех пользователей
+        try:
+            user_ids = await get_all_user_ids()
+            logging.info("Обновление WebApp-кнопок для %d пользователей…", len(user_ids))
+            for user_id in user_ids:
+                try:
+                    target_url = await get_dynamic_webapp_url(user_id)
+                    await bot.set_chat_menu_button(
+                        chat_id=user_id,
+                        menu_button=MenuButtonWebApp(
+                            text="Открыть приложение",
+                            web_app=WebAppInfo(url=target_url),
+                        ),
+                    )
+                    await asyncio.sleep(0.05)  # ≈20 запросов/сек во избежание лимитов
+                except Exception:
+                    continue
+            logging.info("Кнопки WebApp обновлены")
+        except Exception:
+            logging.exception("Ошибка обновления кнопок WebApp")
 
 
 async def main():
@@ -75,7 +99,7 @@ async def main():
     await refresh_schedule_cache()
 
     # Запускаем фоновый цикл обновления
-    asyncio.create_task(schedule_refresh_loop())
+    asyncio.create_task(schedule_refresh_loop(bot))
 
     # Настройка кнопки Меню и профиля бота перед стартом опроса
     await set_main_menu(bot)
