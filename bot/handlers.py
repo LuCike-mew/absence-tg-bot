@@ -32,28 +32,16 @@ def compress_history(history_records: list[tuple]) -> str:
 
 
 async def get_dynamic_webapp_url(user_id: int) -> str:
-    """Формирует URL веб-приложения.
-
-    Если настроен API_URL — передаём только ссылку на API:
-      ?api=<API_URL>&uid=<user_id>
-    (фронтенд сам запросит расписание и историю через HTTP).
-
-    Иначе — передаём сжатое расписание и историю (старый режим sendData).
-    """
+    """Формирует URL со сжатым расписанием и историей."""
     from datetime import date
-    from config import API_URL as api_url
-
-    if api_url:
-        # Новый режим (API): фронтенд сам заберёт данные через fetch
-        return f"{WEB_APP_URL}?api={urllib.parse.quote(api_url)}&uid={user_id}"
-
-    # Старый режим: сжатые параметры в URL
     month_schedule = await get_cached_month_schedule()
     history_records = await get_user_absences(user_id)
 
+    # Первое число месяца — чтобы WebApp знал границу навигации
     today = date.today()
     month_start = date(today.year, today.month, 1).isoformat()
 
+    # Сжимаем оба параметра, чтобы влезть в лимит Telegram WebApp URL
     compressed_week = _gzip_b64(json.dumps(month_schedule, ensure_ascii=False))
     compressed_history = compress_history(history_records)
 

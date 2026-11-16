@@ -65,6 +65,7 @@ def _build_mock_week() -> list:
             "date": current.strftime("%d.%m"),
             "full_date": current.isoformat(),
             "pairs": mock_pairs,
+            "has_site_replacements": True,
         })
     return result
 
@@ -620,13 +621,15 @@ async def get_replacement_urls() -> list[str]:
 async def get_replacements_for_group(
     dates: list[date] | None = None,
     group_name: str = GROUP_NAME,
-) -> dict:
+) -> tuple[dict, bool]:
     """
     Загружает и разбирает PDF-замены для группы.
 
     Если dates не передан — используется текущая неделя (_current_week_dates).
-    Возвращает {date_key (ISO): {номер_пары: {"teacher", "room"}}}.
-    Пустой словарь, если замен нет или файлы недоступны.
+    Возвращает ({date_key (ISO): {номер_пары: {"teacher", "room"}}}, has_site_repl).
+    has_site_repl = True, если на сайте найден и успешно скачан хотя бы один PDF
+    замен (даже если в нём нет записей для нашей группы).
+    Пустой словарь + False, если замен нет или файлы недоступны.
 
     Источники ссылок:
     1. Страница расписания (актуальные PDF «ZAMENY-…»).
@@ -648,11 +651,13 @@ async def get_replacements_for_group(
             unique.append(url)
 
     result: dict[str, dict[int, str]] = {}
+    any_pdf_downloaded = False
     for url in unique:
         # Для PDF замен 404 — норма (нет замен на эту дату): не ретраим, не логируем
         content = await _fetch(url, max_retries=0, quiet=True)
         if not content:
             continue
+        any_pdf_downloaded = True
         try:
             parsed = parse_replacement_pdf(content, group_name)
         except Exception:  # noqa: BLE001
@@ -663,7 +668,7 @@ async def get_replacements_for_group(
 
     if result:
         logging.info("Замены найдены для дат: %s", ", ".join(sorted(result)))
-    return result
+    return result, any_pdf_downloaded
 
 
 # ── главная точка входа ──────────────────────────────────────────────────────
@@ -673,12 +678,14 @@ def _build_days(
     dates: list[date],
     main_pairs: dict[int, dict[int, dict]],
     replacements: dict[str, dict[int, dict]],
+    has_site_replacements: bool = False,
 ) -> list:
     """
     Строит список day-объектов для переданных дат.
 
     dates — список date, main_pairs — {weekday_index: {pair_num: {subject, room, is_replacement}}},
     replacements — {date_key (ISO): {pair_num: {teacher, room}}}.
+    has_site_replacements — True, если на сайте найден PDF замен (даже без записей для группы).
     Пропускает воскресенья (weekday >= 6).
     """
     result = []
@@ -735,6 +742,7 @@ def _build_days(
             "date": current.strftime("%d.%m"),
             "full_date": date_key,
             "pairs": pairs,
+            "has_site_replacements": has_site_replacements,
         })
     return result
 
@@ -910,7 +918,7 @@ async def get_schedule_for_range(
         periods[_governing_tuesday(d)].append(d)
 
     # Скачиваем замены один раз для всего диапазона
-    all_replacements = await get_replacements_for_group(
+    all_replacements, has_replacements_on_site = await get_replacements_for_group(
         dates=all_dates, group_name=group_name,
     )
 
@@ -934,7 +942,7 @@ async def get_schedule_for_range(
                 # .xls для этого периода не найден — пусто
                 template = {day: {} for day in range(6)}
 
-        period_result = _build_days(period_dates, template, all_replacements)
+        period_result = _build_days(period_dates, template, all_replacements, has_replacements_on_site)
         result.extend(period_result)
 
     # Сортируем по дате

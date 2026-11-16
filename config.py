@@ -48,13 +48,6 @@ DB_PATH = os.path.join(BASE_DIR, "database", "bot_data.db")
 
 WEB_APP_URL = os.getenv("WEB_APP_URL", "https://lucike-mew.github.io/absence-webapp/")
 
-# Публичный URL API-сервера (Cloudflare Tunnel или другой HTTPS-туннель).
-# Если не задан — WebApp будет работать по-старому (sendData без API).
-API_URL = os.getenv("API_URL", "")
-
-# Локальный порт HTTP-сервера (FastAPI uvicorn). Туннель подключается к этому порту.
-API_PORT = int(os.getenv("API_PORT", "8000"))
-
 # Флаг для переключения между тестовыми моками и реальным парсингом
 # True  — использовать тестовые моки (не ходит в сеть)
 # False — реальный парсинг с сайта колледжа
