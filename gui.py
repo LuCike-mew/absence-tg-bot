@@ -23,6 +23,14 @@ ICON_PATH = "icon.ico"
 REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 APP_NAME = "BotControlPanel"
 
+# ── Автоперезапуск упавшего процесса ─────────────────────────────────────────
+# Если процесс бота всё же завершился сам (не по кнопке «Остановить»), панель
+# поднимает его снова через AUTO_RESTART_DELAY_MS. Бот также умеет
+# перезапускать свой внутренний цикл (см. main.py), но эта страховка нужна на
+# случай фатальных ошибок (например, крах интерпретатора).
+AUTO_RESTART_DELAY_MS = 60_000   # попытка перезапуска раз в минуту
+AUTO_RESTART_MAX_ATTEMPTS = 30   # ограничение, чтобы не зацикливаться вечно
+
 
 class BotControlApp(ctk.CTk):
     def __init__(self):
@@ -34,6 +42,11 @@ class BotControlApp(ctk.CTk):
         self.process = None
         self.log_thread = None
         self.tray_icon = None
+        # Флаги управления автоперезапуском
+        self._restart_enabled = False   # перезапускать упавший процесс?
+        self._restart_attempts = 0      # сколько попыток уже сделано подряд
+        self._restart_job = None        # id таймера self.after
+        self._stopping = False          # остановка по кнопке/выходу
 
         self.setup_window_icon()
         self.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
@@ -227,8 +240,41 @@ class BotControlApp(ctk.CTk):
 
     def on_process_finished(self):
         self.process = None
-        self.lbl_status.configure(text="Статус: Остановлен", text_color="#ff5252")
         self.append_log("[СИСТЕМА] Процесс бота завершен.\n")
+
+        # Не перезапускаем при штатной остановке из GUI.
+        if self._stopping:
+            self.lbl_status.configure(text="Статус: Остановлен", text_color="#ff5252")
+            return
+
+        # Автоперезапуск: пробуем поднять процесс снова раз в минуту.
+        if self._restart_enabled and self._restart_attempts < AUTO_RESTART_MAX_ATTEMPTS:
+            self._restart_attempts += 1
+            self.lbl_status.configure(
+                text=f"Статус: Перезапуск ({self._restart_attempts}/{AUTO_RESTART_MAX_ATTEMPTS})…",
+                text_color="#ffb74d",
+            )
+            self.append_log(
+                f"[СИСТЕМА] Автоперезапуск через {AUTO_RESTART_DELAY_MS // 1000} сек "
+                f"(попытка {self._restart_attempts}/{AUTO_RESTART_MAX_ATTEMPTS})…\n"
+            )
+            self._restart_job = self.after(AUTO_RESTART_DELAY_MS, self._auto_restart)
+        else:
+            self.lbl_status.configure(text="Статус: Остановлен", text_color="#ff5252")
+            if self._restart_enabled:
+                self.append_log(
+                    "[СИСТЕМА] Достигнут лимит автоперезапусков. "
+                    "Проверьте логи и запустите бота вручную.\n"
+                )
+
+    def _auto_restart(self):
+        """Вызывается таймером: поднимает упавший процесс бота заново."""
+        self._restart_job = None
+        # Если процесс уже поднят (например, вручную) — ничего не делаем.
+        if self.process is not None or self._stopping:
+            return
+        self.append_log("[СИСТЕМА] Перезапуск бота…\n")
+        self.start_bot(from_restart=True)
 
     @staticmethod
     def _bot_env() -> dict:
@@ -238,7 +284,7 @@ class BotControlApp(ctk.CTk):
         env["PYTHONUTF8"] = "1"
         return env
 
-    def start_bot(self):
+    def start_bot(self, from_restart: bool = False):
         if self.process is None:
             try:
                 if getattr(sys, 'frozen', False):
@@ -247,6 +293,12 @@ class BotControlApp(ctk.CTk):
                 else:
                     # В режиме разработка запускаем main.py через Python
                     cmd = [sys.executable, "-u", "main.py"]
+
+                # Ручной запуск — включаем автоперезапуск и сбрасываем счётчик.
+                if not from_restart:
+                    self._restart_attempts = 0
+                self._restart_enabled = True
+                self._stopping = False
 
                 self.process = subprocess.Popen(
                     cmd,
@@ -264,9 +316,21 @@ class BotControlApp(ctk.CTk):
                 self.log_thread = threading.Thread(target=self.read_output, daemon=True)
                 self.log_thread.start()
             except Exception as e:
+                self._restart_enabled = False
                 self.append_log(f"[ОШИБКА] Не удалось запустить скрипт: {e}\n")
 
     def stop_bot(self):
+        # Штатная остановка: гасим автоперезапуск и висящий таймер.
+        self._stopping = True
+        self._restart_enabled = False
+        self._restart_attempts = 0
+        if self._restart_job is not None:
+            try:
+                self.after_cancel(self._restart_job)
+            except Exception:
+                pass
+            self._restart_job = None
+
         if self.process:
             self.process.terminate()
             self.process = None

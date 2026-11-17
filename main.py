@@ -8,6 +8,14 @@ from database.db import init_db, cleanup_old_absences
 from bot.handlers import router
 from parser.schedule import refresh_schedule_cache
 
+# ── Самовосстановление ────────────────────────────────────────────────────────
+# Если сеть пропала на миг (мигание интернета, перезагрузка роутера, обрыв у
+# хостера), цикл опроса Telegram падает и процесс завершается. Ниже —
+# «супервайзер»: он ловит любые сбои и повторяет попытки раз в минуту, пока
+# соединение не восстановится. Бот поднимается сам, без вмешательства из GUI.
+RETRY_DELAY_SECONDS = 60  # интервал между попытками восстановления
+_startup_done = False    # первичная настройка (БД, меню, кэш) выполнена хотя бы раз
+
 # Принудительно переводим stdout/stderr в UTF-8. Иначе при запуске из exe
 # (пайп с GUI-панелью) кириллица в логах кодируется в cp1251, а читающая
 # сторона ждёт UTF-8 — ломается чтение логов и бот виснет.
@@ -88,24 +96,75 @@ async def schedule_refresh_loop(bot: Bot):
             logging.exception("Ошибка обновления кнопок WebApp")
 
 
+async def _safe_run(coro, description: str):
+    """Выполняет корутину, гася ошибку: сбой сети не должен рушить запуск."""
+    try:
+        await coro
+    except Exception:
+        logging.exception("Не удалось выполнить '%s' (продолжаю работу)", description)
+
+
+async def _initial_setup(bot: Bot):
+    """Разовая настройка перед первым опросом Telegram.
+
+    Каждый шаг защищён: если нет сети или упал запрос — просто логируем и идём
+    дальше, чтобы бот всё равно стартовал и подключился при появлении связи.
+    """
+    await _safe_run(init_db(), "инициализация БД")
+
+    logging.info("Первичная загрузка расписания…")
+    await _safe_run(refresh_schedule_cache(), "первичная загрузка расписания")
+
+    await _safe_run(set_main_menu(bot), "регистрация команд меню")
+    await _safe_run(set_bot_profile(bot), "установка профиля бота")
+
+
+async def run_bot(bot: Bot, dp: Dispatcher):
+    """Супервайзер: держит бота в работе, восстанавливаясь после любой ошибки.
+
+    Логика:
+    - первый запуск выполняет разовую настройку (БД, расписание, меню);
+    - цикл опроса Telegram перезапускается при сетевом сбое;
+    - интервал между попытками — RETRY_DELAY_SECONDS (раз в минуту), пока
+      соединение не восстановится;
+    - фоновое обновление расписания поднимается один раз и живёт всё время.
+    """
+    global _startup_done
+
+    if not _startup_done:
+        await _initial_setup(bot)
+        # Фоновый цикл обновления запускаем один раз — в отдельной «песочнице»
+        # ошибок, чтобы его падение не привлекало внимание супервайзера.
+        asyncio.create_task(
+            _safe_run(schedule_refresh_loop(bot), "фоновое обновление")
+        )
+        _startup_done = True
+
+    while True:
+        try:
+            # drop_pending_updates=False — не теряем накопившиеся сообщения
+            await dp.start_polling(bot)
+            return  # штатное завершение (например, при остановке)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.warning(
+                "Цикл опроса Telegram прерван (%s: %s). "
+                "Перезапуск через %d сек…",
+                type(exc).__name__, exc, RETRY_DELAY_SECONDS,
+            )
+        # Ждём перед следующей попыткой; отмену пробрасываем наружу
+        try:
+            await asyncio.sleep(RETRY_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
 async def main():
-    await init_db()
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-
-    # Первичное заполнение кэша расписания
-    logging.info("Первичная загрузка расписания…")
-    await refresh_schedule_cache()
-
-    # Запускаем фоновый цикл обновления
-    asyncio.create_task(schedule_refresh_loop(bot))
-
-    # Настройка кнопки Меню и профиля бота перед стартом опроса
-    await set_main_menu(bot)
-    await set_bot_profile(bot)
-
-    await dp.start_polling(bot)
+    await run_bot(bot, dp)
 
 
 if __name__ == "__main__":
