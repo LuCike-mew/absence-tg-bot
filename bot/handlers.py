@@ -1,13 +1,15 @@
 import json
 import gzip
 import base64
+import asyncio
 import logging
 import urllib.parse
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, MenuButtonWebApp, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.exceptions import TelegramForbiddenError
 from parser.schedule import get_cached_month_schedule
-from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence, get_month_absence_hours
+from database.db import add_absence, get_user_absences, register_user, get_all_user_ids, delete_absence, get_month_absence_hours, remove_user, get_notify_replacements, set_notify_replacements
 from config import WEB_APP_URL, ADMIN_USER_ID
 
 router = Router()
@@ -17,6 +19,16 @@ def _gzip_b64(text: str) -> str:
     """Сжимает строку через gzip и кодирует в url-safe base64 без '='."""
     compressed = gzip.compress(text.encode("utf-8"))
     return base64.urlsafe_b64encode(compressed).decode("utf-8").rstrip("=")
+
+
+def _as_str(value) -> str:
+    """Безопасно приводит значение к str (иначе — пустая строка)."""
+    return value if isinstance(value, str) else ""
+
+
+def _as_int(value) -> int:
+    """Безопасно приводит значение к int (иначе — 0)."""
+    return value if (isinstance(value, int) and not isinstance(value, bool)) else 0
 
 
 def compress_history(history_records: list[tuple]) -> str:
@@ -50,6 +62,52 @@ async def get_dynamic_webapp_url(user_id: int) -> str:
     encoded_month_start = urllib.parse.quote(month_start)
 
     return f"{WEB_APP_URL}?v=13&week={encoded_week}&h={encoded_history}&ms={encoded_month_start}"
+
+
+async def safe_send_message(bot, chat_id: int, text: str, parse_mode: str | None = None) -> bool:
+    """
+    Отправляет сообщение пользователю, не падая при «мёртвых» юзерах.
+
+    Если пользователь заблокировал бота или его аккаунт деактивирован
+    (Telegram отвечает 403 Forbidden) — удаляем его из базы, чтобы не
+    тратить на него запросы в будущих рассылках.
+
+    Возвращает True, если сообщение отправлено.
+    """
+    try:
+        await bot.send_message(chat_id, text, parse_mode=parse_mode)
+        return True
+    except TelegramForbiddenError:
+        logging.info(
+            "Пользователь %s заблокировал бота или деактивирован — удаляю из базы",
+            chat_id,
+        )
+        await remove_user(chat_id)
+        return False
+
+
+async def safe_set_menu_button(bot, chat_id: int, target_url: str) -> bool:
+    """
+    Обновляет WebApp-кнопку пользователя, удаляя его из базы при блокировке.
+
+    Возвращает True, если кнопка обновлена.
+    """
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=chat_id,
+            menu_button=MenuButtonWebApp(
+                text="Открыть приложение",
+                web_app=WebAppInfo(url=target_url),
+            ),
+        )
+        return True
+    except TelegramForbiddenError:
+        logging.info(
+            "Пользователь %s заблокировал бота или деактивирован — удаляю из базы",
+            chat_id,
+        )
+        await remove_user(chat_id)
+        return False
 
 
 @router.message(CommandStart())
@@ -118,6 +176,28 @@ async def cmd_about(message: Message):
     await message.answer(about_text, parse_mode="HTML")
 
 
+@router.message(Command("notify"))
+async def cmd_notify(message: Message):
+    """Включает/выключает персональные уведомления о новых заменах."""
+    user_id = message.from_user.id
+    # На случай, если пользователь ещё не выполнял /start — гарантируем строку в БД.
+    await register_user(user_id)
+    current = await get_notify_replacements(user_id)
+    new_state = not current
+    await set_notify_replacements(user_id, new_state)
+
+    if new_state:
+        await message.answer(
+            "🔔 Уведомления о новых заменах <b>включены</b>.\n"
+            "Буду присылать сообщение, когда в расписании появится новая замена."
+        , parse_mode="HTML")
+    else:
+        await message.answer(
+            "🔕 Уведомления о новых заменах <b>выключены</b>.\n"
+            "Больше не буду присылать сообщения о заменах."
+        , parse_mode="HTML")
+
+
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
     """Показывает количество зарегистрированных пользователей (только для админа)."""
@@ -176,19 +256,26 @@ async def cmd_broadcast(message: Message):
 
     # Отправляем сообщение каждому пользователю
     sent = 0
+    removed = 0
     failed = 0
     for uid in all_users:
         try:
             await message.bot.send_message(uid, text)
             sent += 1
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота или деактивирован — удаляем из базы
+            removed += 1
+            await remove_user(uid)
         except Exception:
             failed += 1
+        await asyncio.sleep(0.05)  # не упираемся в лимиты Telegram
 
     # Отчёт админу
     await message.answer(
         f"📊 <b>Рассылка завершена</b>\n\n"
         f"✅ Отправлено: {sent}\n"
         f"❌ Не удалось: {failed}\n"
+        f"🗑 Удалено заблокировавших: {removed}\n"
         f"👥 Всего пользователей: {total}",
         parse_mode="HTML"
     )
@@ -206,28 +293,35 @@ async def process_web_app_data(message: Message):
         await message.answer("⚠️ Не удалось разобрать данные, попробуйте ещё раз.")
         return
 
+    if not isinstance(data, dict):
+        logging.warning("Web App прислал JSON не-объект: %r", raw_data)
+        return
+
     user_id = message.from_user.id
     response_text = None
 
     # ── Обработка удалений ──────────────────────────────────────────────
-    deletions = data.get("deletions", [])
-    if deletions:
+    deletions = data.get("deletions")
+    if isinstance(deletions, list):
         deleted_count = 0
         details_info = []
         for item in deletions:
-            success = await delete_absence(
-                absence_id=item["id"],
-                user_id=user_id
-            )
+            if not isinstance(item, dict):
+                continue
+            absence_id = item.get("id")
+            if isinstance(absence_id, bool) or not isinstance(absence_id, int):
+                logging.warning("Web App: пропущено удаление с некорректным id: %r", item)
+                continue
+            success = await delete_absence(absence_id=absence_id, user_id=user_id)
             if success:
                 deleted_count += 1
-                date_iso = item.get("date", "")
-                pair_num = item.get("pair_num", 0)
+                date_iso = _as_str(item.get("date"))
+                pair_num = _as_int(item.get("pair_num"))
                 # Форматируем дату: YYYY-MM-DD → DD.MM
                 date_str = date_iso
                 if len(date_str) == 10 and date_str[4] == "-":
                     date_str = f"{date_str[8:10]}.{date_str[5:7]}"
-                subject = item.get("subject", "")
+                subject = _as_str(item.get("subject"))
                 details_info.append((date_iso, pair_num, f"{date_str} {pair_num} пара — {subject}"))
 
         details_info.sort(key=lambda x: (x[0], x[1]))
@@ -235,27 +329,45 @@ async def process_web_app_data(message: Message):
         response_text = f"🗑 Удалено пропусков: {deleted_count}\n{lines}"
 
     # ── Обработка сохранения пропусков ──────────────────────────────────
-    records = data.get("absences", [])
-    if records:
+    records = data.get("absences")
+    if isinstance(records, list):
         saved = 0
         skipped = 0
+        invalid = 0
         subjects_info = []
         for item in records:
+            if not isinstance(item, dict):
+                invalid += 1
+                continue
+            pair_number = item.get("pair_number")
+            subject = item.get("subject")
+            date_val = item.get("date")
+            # Валидация типов: пара — целое число, предмет — строка,
+            # дата — строка либо отсутствует.
+            if isinstance(pair_number, bool) or not isinstance(pair_number, int):
+                invalid += 1
+                continue
+            if not isinstance(subject, str):
+                invalid += 1
+                continue
+            if date_val is not None and not isinstance(date_val, str):
+                invalid += 1
+                continue
+
             inserted = await add_absence(
                 user_id=user_id,
-                pair_number=item["pair_number"],
-                subject=item["subject"],
-                date=item.get("date")
+                pair_number=pair_number,
+                subject=subject,
+                date=date_val
             )
             if inserted:
                 saved += 1
-                date_iso = item.get("date", "")
-                pair_num = item["pair_number"]
+                date_iso = date_val or ""
                 # Форматируем дату: YYYY-MM-DD → DD.MM
                 date_str = date_iso
                 if len(date_str) == 10 and date_str[4] == "-":
                     date_str = f"{date_str[8:10]}.{date_str[5:7]}"
-                subjects_info.append((date_iso, pair_num, f"{date_str} {pair_num} пара — {item['subject']}"))
+                subjects_info.append((date_iso, pair_number, f"{date_str} {pair_number} пара — {subject}"))
             else:
                 skipped += 1
 
@@ -264,6 +376,8 @@ async def process_web_app_data(message: Message):
         response_text = f"✅ Сохранено пропусков: {saved}"
         if skipped > 0:
             response_text += f"\n⚠️ Пропущено дубликатов: {skipped}"
+        if invalid > 0:
+            response_text += f"\n⚠️ Отклонено некорректных записей: {invalid}"
         response_text += f"\n{lines}"
 
         # Проверка на превышение 30 часов за текущий месяц

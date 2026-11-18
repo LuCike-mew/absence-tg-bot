@@ -1,4 +1,7 @@
 import os
+import time
+import glob
+import logging
 import asyncio
 import aiosqlite
 from datetime import datetime, date, timedelta
@@ -36,14 +39,30 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notify_replacements INTEGER NOT NULL DEFAULT 1
             );
         """)
+        # Миграция для уже существующих баз: добавляем флаг уведомлений,
+        # если таблица создавалась до появления этой колонки.
+        try:
+            await db.execute(
+                "ALTER TABLE users ADD COLUMN notify_replacements INTEGER NOT NULL DEFAULT 1"
+            )
+        except Exception:
+            pass  # колонка уже существует
         await db.execute("""
             CREATE TABLE IF NOT EXISTS schedule_snapshots (
                 week_start TEXT PRIMARY KEY,
                 template_json TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         await db.commit()
@@ -204,6 +223,79 @@ async def get_all_user_ids() -> list[int]:
             return [row[0] for row in rows]
 
 
+async def remove_user(user_id: int) -> None:
+    """Удаляет пользователя из базы (например, если он заблокировал бота)."""
+    async with _db_write_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            await db.commit()
+
+
+# ── Персональные настройки уведомлений ────────────────────────────────────────
+
+
+async def get_notify_replacements(user_id: int) -> bool:
+    """Возвращает, включены ли уведомления о заменах у пользователя."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT notify_replacements FROM users WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return bool(row[0]) if row else True  # по умолчанию включено
+
+
+async def set_notify_replacements(user_id: int, enabled: bool) -> None:
+    """Включает/выключает уведомления о заменах для пользователя."""
+    async with _db_write_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET notify_replacements = ? WHERE user_id = ?",
+                (1 if enabled else 0, user_id),
+            )
+            await db.commit()
+
+
+async def get_user_ids_with_notifications() -> list[int]:
+    """Возвращает id пользователей, у которых включены уведомления о заменах."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM users WHERE notify_replacements = 1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+# ── Ключ-значение хранилище (состояние бота между перезапусками) ──────────────
+# Используется, например, для хранения отпечатка замен, чтобы уведомления о
+# новых заменах переживали перезапуск процесса.
+
+
+async def get_state(key: str) -> str | None:
+    """Возвращает сохранённое строковое значение по ключу или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM bot_state WHERE key = ?", (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def set_state(key: str, value: str) -> None:
+    """Сохраняет строковое значение по ключу (создаёт или перезаписывает)."""
+    async with _db_write_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO bot_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (key, value),
+            )
+            await db.commit()
+
+
 # ── Снимки расписания ─────────────────────────────────────────────────────────
 # Шаблон недели (weekday_index → пары), распарсенный из .xls, сохраняется
 # под ключом «понедельник недели» (YYYY-MM-DD). Нужно, чтобы прошлые недели
@@ -245,3 +337,65 @@ async def get_all_snapshot_weeks() -> list[str]:
         async with db.execute("SELECT week_start FROM schedule_snapshots") as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
+
+
+# ── Резервное копирование БД ─────────────────────────────────────────────────
+# bot_data.db хранит личные пропуски — раз в сутки делаем её копию в backups/,
+# чтобы порча файла не стёрла историю. Используется online-backup API SQLite
+# (безопасно при работающей БД в WAL-режиме).
+
+#: Папка для резервных копий (рядом с файлом БД).
+BACKUP_DIR = os.path.join(os.path.dirname(DB_PATH), "backups")
+#: Интервал между бэкапами (сутки).
+BACKUP_INTERVAL_SECONDS = 24 * 3600
+#: Сколько последних копий хранить (остальные удаляются при ротации).
+BACKUP_KEEP_COUNT = 14
+#: Ключ в bot_state с временем последнего бэкапа (epoch-секунды).
+BACKUP_STATE_KEY = "last_backup"
+
+
+def _rotate_backups() -> None:
+    """Оставляет последние BACKUP_KEEP_COUNT копий, удаляя более старые."""
+    try:
+        pattern = os.path.join(BACKUP_DIR, "bot_data_*.db")
+        files = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        for old in files[BACKUP_KEEP_COUNT:]:
+            try:
+                os.remove(old)
+                logging.info("Удалена старая резервная копия: %s", old)
+            except OSError:
+                pass
+    except OSError:
+        logging.exception("Ошибка ротации резервных копий")
+
+
+async def backup_database() -> str:
+    """Создаёт резервную копию БД через online-backup и возвращает путь."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"bot_data_{timestamp}.db")
+    async with aiosqlite.connect(DB_PATH) as source:
+        await source.backup(dest)
+    _rotate_backups()
+    logging.info("Создана резервная копия БД: %s", dest)
+    return dest
+
+
+async def backup_database_if_due() -> str | None:
+    """
+    Делает бэкап, если с прошлого прошло больше суток.
+
+    Возвращает путь к новой копии либо None, если бэкап пока не нужен.
+    """
+    last_raw = await get_state(BACKUP_STATE_KEY)
+    try:
+        last = float(last_raw) if last_raw else 0.0
+    except ValueError:
+        last = 0.0
+
+    if time.time() - last < BACKUP_INTERVAL_SECONDS:
+        return None
+
+    dest = await backup_database()
+    await set_state(BACKUP_STATE_KEY, str(time.time()))
+    return dest

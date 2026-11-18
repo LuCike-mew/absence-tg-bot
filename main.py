@@ -6,7 +6,7 @@ from aiogram.types import BotCommand
 from config import BOT_TOKEN
 from database.db import init_db, cleanup_old_absences
 from bot.handlers import router
-from parser.schedule import refresh_schedule_cache
+from parser.schedule import refresh_schedule_cache, close_http_client
 
 # ── Самовосстановление ────────────────────────────────────────────────────────
 # Если сеть пропала на миг (мигание интернета, перезагрузка роутера, обрыв у
@@ -15,6 +15,13 @@ from parser.schedule import refresh_schedule_cache
 # соединение не восстановится. Бот поднимается сам, без вмешательства из GUI.
 RETRY_DELAY_SECONDS = 60  # интервал между попытками восстановления
 _startup_done = False    # первичная настройка (БД, меню, кэш) выполнена хотя бы раз
+
+# Ключ в bot_state, под которым хранится отпечаток последних известных замен.
+REPLACEMENTS_STATE_KEY = "replacements_fingerprint"
+
+# Ключ в bot_state с подписью расписания+месяца, по которой решаем,
+# нужно ли обновлять WebApp-кнопки (чтобы не рассылать их каждый час впустую).
+BUTTONS_STATE_KEY = "buttons_signature"
 
 # Принудительно переводим stdout/stderr в UTF-8. Иначе при запуске из exe
 # (пайп с GUI-панелью) кириллица в логах кодируется в cp1251, а читающая
@@ -45,6 +52,7 @@ async def set_main_menu(bot: Bot):
     """Регистрация команд в кнопке 'Меню' Telegram."""
     main_menu_commands = [
         BotCommand(command="/start", description="Запустить бота и открыть приложение"),
+        BotCommand(command="/notify", description="Вкл/выкл уведомления о заменах"),
         BotCommand(command="/about", description="О проекте и авторах"),
         BotCommand(command="/broadcast", description="Рассылка сообщений (только админ)"),
         BotCommand(command="/stats", description="Статистика бота (только админ)"),
@@ -58,11 +66,50 @@ async def set_bot_profile(bot: Bot):
     await bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
 
 
+def _format_replacement(rec: list) -> str:
+    """Форматирует одну замену для уведомления.
+
+    rec — [full_date, num, subject, room, original_subject, original_room].
+    """
+    full_date, num, subject, room, original_subject = rec[0], rec[1], rec[2], rec[3], rec[4]
+    date_str = full_date
+    if isinstance(full_date, str) and len(full_date) == 10 and full_date[4] == "-":
+        date_str = f"{full_date[8:10]}.{full_date[5:7]}"
+
+    details = []
+    if subject:
+        details.append(f"<b>{subject}</b>")
+    if room:
+        details.append(f"ауд. {room}")
+
+    line = f"📅 {date_str} · {num} пара"
+    if details:
+        line += " — " + ", ".join(details)
+    if original_subject and original_subject != subject:
+        line += f" <i>(вместо {original_subject})</i>"
+    return line
+
+
+async def notify_replacements(bot: Bot, replacements: list) -> None:
+    """Рассылает уведомление о новых заменах пользователям, у которых оно включено."""
+    from database.db import get_user_ids_with_notifications
+    from bot.handlers import safe_send_message
+
+    lines = [_format_replacement(r) for r in replacements]
+    text = "🔄 <b>Новые замены в расписании</b>\n\n" + "\n".join(lines)
+
+    user_ids = await get_user_ids_with_notifications()
+    logging.info("Уведомление о новых заменах для %d пользователей…", len(user_ids))
+    for user_id in user_ids:
+        await safe_send_message(bot, user_id, text, parse_mode="HTML")
+        await asyncio.sleep(0.05)  # ≈20 запросов/сек во избежание лимитов
+
+
 async def schedule_refresh_loop(bot: Bot):
     """Фоновый цикл: раз в час обновляет кэш, чистит пропуски и обновляет кнопки WebApp."""
-    from database.db import get_all_user_ids
-    from bot.handlers import get_dynamic_webapp_url
-    from aiogram.types import MenuButtonWebApp, WebAppInfo
+    from database.db import get_all_user_ids, get_state, set_state, backup_database_if_due
+    from bot.handlers import get_dynamic_webapp_url, safe_set_menu_button
+    from parser.schedule import refresh_schedule_cache as _refresh, replacements_fingerprint, new_replacements, schedule_fingerprint
 
     while True:
         await asyncio.sleep(3600)
@@ -70,30 +117,63 @@ async def schedule_refresh_loop(bot: Bot):
             await cleanup_old_absences()
         except Exception:
             logging.exception("Ошибка очистки старых пропусков")
+
+        # ── Резервное копирование БД (раз в сутки) ─────────────────────
         try:
-            await refresh_schedule_cache()
+            backup_path = await backup_database_if_due()
+            if backup_path:
+                logging.info("Создан бэкап БД: %s", backup_path)
+        except Exception:
+            logging.exception("Ошибка резервного копирования БД")
+
+        # ── Обновление кэша ─────────────────────────────────────────────
+        schedule = None
+        old_fingerprint = None
+        try:
+            old_fingerprint = await get_state(REPLACEMENTS_STATE_KEY)
+        except Exception:
+            logging.exception("Ошибка чтения отпечатка замен")
+        try:
+            schedule = await _refresh()
         except Exception:
             logging.exception("Ошибка фонового обновления расписания")
-        # После обновления кэша — обновляем WebApp-кнопку у всех пользователей
-        try:
-            user_ids = await get_all_user_ids()
-            logging.info("Обновление WebApp-кнопок для %d пользователей…", len(user_ids))
-            for user_id in user_ids:
-                try:
-                    target_url = await get_dynamic_webapp_url(user_id)
-                    await bot.set_chat_menu_button(
-                        chat_id=user_id,
-                        menu_button=MenuButtonWebApp(
-                            text="Открыть приложение",
-                            web_app=WebAppInfo(url=target_url),
-                        ),
-                    )
-                    await asyncio.sleep(0.05)  # ≈20 запросов/сек во избежание лимитов
-                except Exception:
-                    continue
-            logging.info("Кнопки WebApp обновлены")
-        except Exception:
-            logging.exception("Ошибка обновления кнопок WebApp")
+
+        # ── Уведомления о новых заменах ────────────────────────────────
+        if schedule is not None:
+            try:
+                fresh = new_replacements(schedule, old_fingerprint)
+                await set_state(REPLACEMENTS_STATE_KEY, replacements_fingerprint(schedule))
+                if fresh:
+                    await notify_replacements(bot, fresh)
+            except Exception:
+                logging.exception("Ошибка уведомления о новых заменах")
+
+        # После обновления кэша — обновляем WebApp-кнопки, но только если
+        # расписание или месяц реально изменились. Иначе содержимое кнопки
+        # (week + ms) не поменялось бы, и рассылка N запросов была бы впустую.
+        if schedule is not None:
+            try:
+                from datetime import date
+                month_start = date.today().replace(day=1).isoformat()
+                new_signature = f"{schedule_fingerprint(schedule)}|{month_start}"
+                old_signature = await get_state(BUTTONS_STATE_KEY)
+
+                if new_signature == old_signature:
+                    logging.info("Расписание не изменилось — пропускаю обновление WebApp-кнопок")
+                else:
+                    user_ids = await get_all_user_ids()
+                    logging.info("Обновление WebApp-кнопок для %d пользователей…", len(user_ids))
+                    for user_id in user_ids:
+                        try:
+                            target_url = await get_dynamic_webapp_url(user_id)
+                            await safe_set_menu_button(bot, user_id, target_url)
+                            await asyncio.sleep(0.05)  # ≈20 запросов/сек во избежание лимитов
+                        except Exception:
+                            continue
+                    await set_state(BUTTONS_STATE_KEY, new_signature)
+                    logging.info("Кнопки WebApp обновлены")
+            except Exception:
+                logging.exception("Ошибка обновления кнопок WebApp")
 
 
 async def _safe_run(coro, description: str):
@@ -164,7 +244,10 @@ async def main():
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    await run_bot(bot, dp)
+    try:
+        await run_bot(bot, dp)
+    finally:
+        await close_http_client()
 
 
 if __name__ == "__main__":

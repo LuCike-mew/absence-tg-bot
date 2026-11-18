@@ -8,6 +8,8 @@
 Переключение — флаг USE_MOCK_SCHEDULE в config.py.
 """
 
+import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -94,6 +96,37 @@ class _LinksParser(HTMLParser):
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
+#: Единый переиспользуемый HTTP-клиент на весь процесс. Раньше для каждого
+#: запроса (и для каждой ретрай-попытки) создавался новый AsyncClient, а вместе
+#: с ним — новое TLS-соединение. Один клиент держит пул соединений и избавляет
+#: от повторных рукопожатий.
+_http_client: httpx.AsyncClient | None = None
+#: Блокировка для ленивого создания общего клиента.
+_client_lock = asyncio.Lock()
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Лениво создаёт общий HTTP-клиент (безопасно при конкурентных вызовах)."""
+    global _http_client
+    if _http_client is None:
+        async with _client_lock:
+            if _http_client is None:
+                _http_client = httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=True,
+                    headers=BROWSER_HEADERS,
+                )
+    return _http_client
+
+
+async def close_http_client() -> None:
+    """Закрывает общий HTTP-клиент (вызывать при штатном завершении бота)."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
 async def _fetch(
     url: str,
     *,
@@ -107,17 +140,13 @@ async def _fetch(
     При quiet=True ошибки (в т.ч. 404) не логируются — удобно для «прощупывания»
     возможных URL (например, PDF замен по датам), где 404 — норма.
     """
+    client = await _get_http_client()
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=True,
-                headers=BROWSER_HEADERS,
-            ) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                return resp.content
+            resp = await client.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
         except httpx.HTTPError as exc:
             last_exc = exc
             if attempt < max_retries and not quiet:
@@ -981,6 +1010,10 @@ _cached_schedule: list | None = None
 _cache_timestamp: float = 0
 #: Время жизни кэша в секундах (1 час).
 _CACHE_TTL: float = 3600
+#: Блокировка, сериализующая обновление кэша. Без неё после истечения TTL
+#: несколько одновременных запросов (например, пять параллельных /start)
+#: запустят пять параллельных refresh_schedule_cache.
+_cache_lock = asyncio.Lock()
 
 
 async def get_cached_month_schedule(group_name: str = GROUP_NAME) -> list:
@@ -990,7 +1023,12 @@ async def get_cached_month_schedule(group_name: str = GROUP_NAME) -> list:
     """
     if _cached_schedule is not None and (time.time() - _cache_timestamp) < _CACHE_TTL:
         return _cached_schedule
-    return await refresh_schedule_cache(group_name)
+    async with _cache_lock:
+        # Повторная проверка внутри блокировки: за время ожидания другой
+        # корутин мог уже обновить кэш — не делаем лишний запрос к сайту.
+        if _cached_schedule is not None and (time.time() - _cache_timestamp) < _CACHE_TTL:
+            return _cached_schedule
+        return await _refresh_unlocked(group_name)
 
 
 async def refresh_schedule_cache(group_name: str = GROUP_NAME) -> list:
@@ -1002,8 +1040,94 @@ async def refresh_schedule_cache(group_name: str = GROUP_NAME) -> list:
     - фоновой задачей каждый час;
     - автоматически из get_cached_month_schedule при истечении TTL.
     """
+    async with _cache_lock:
+        return await _refresh_unlocked(group_name)
+
+
+async def _refresh_unlocked(group_name: str = GROUP_NAME) -> list:
+    """Фактическое обновление кэша (вызывается только под _cache_lock)."""
     global _cached_schedule, _cache_timestamp
     _cached_schedule = await get_month_schedule(group_name)
     _cache_timestamp = time.time()
     logging.info("Кэш расписания обновлён (%d дней)", len(_cached_schedule))
     return _cached_schedule
+
+
+# ── отпечаток замен (для уведомлений о новых заменах) ────────────────────────
+# Раз в час фоновая задача обновляет кэш. Чтобы понять, появилась ли новая
+# замена, сравниваем канонический список замен с сохранённым ранее.
+
+
+def _replacements_from_schedule(schedule: list) -> list[list]:
+    """
+    Извлекает все пары-замены из расписания в каноническом виде.
+
+    Каждая замена — список [full_date, num, subject, room, original_subject,
+    original_room]. Пара считается заменой, если is_replacement=True (это
+    покрывает и замены из PDF, и пары из секции «Замены» в .xls).
+    """
+    result: list[list] = []
+    for day in schedule or []:
+        full_date = day.get("full_date", "")
+        for pair in day.get("pairs", []):
+            if not pair.get("is_replacement"):
+                continue
+            result.append([
+                full_date,
+                pair.get("num"),
+                pair.get("subject", ""),
+                pair.get("room", ""),
+                pair.get("original_subject", ""),
+                pair.get("original_room", ""),
+            ])
+    return result
+
+
+def replacements_fingerprint(schedule: list) -> str:
+    """Канонический отпечаток всех замен (отсортированный JSON)."""
+    items = _replacements_from_schedule(schedule)
+    items.sort(key=lambda r: (r[0], r[1], r[2]))
+    return json.dumps(items, ensure_ascii=False)
+
+
+def schedule_fingerprint(schedule: list) -> str:
+    """
+    Канонический отпечаток всего расписания (sha256).
+
+    В отличие от replacements_fingerprint учитывает все пары (а не только
+    замены) — используется, чтобы понять, изменилось ли расписание в целом
+    и стоит ли обновлять WebApp-кнопки у пользователей.
+    """
+    canonical = []
+    for day in schedule or []:
+        pairs = []
+        for pair in day.get("pairs", []):
+            pairs.append((
+                pair.get("num"),
+                pair.get("subject", ""),
+                pair.get("room", ""),
+                bool(pair.get("is_replacement")),
+                pair.get("original_subject", ""),
+                pair.get("original_room", ""),
+            ))
+        pairs.sort(key=lambda x: (x[0] or 0, x[1] or "", x[2] or ""))
+        canonical.append({"date": day.get("full_date", ""), "pairs": pairs})
+    data = json.dumps(canonical, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def new_replacements(schedule: list, old_fingerprint: str | None) -> list[list]:
+    """
+    Возвращает замены, которых не было в старом отпечатке.
+
+    При отсутствии старого отпечатка (первый запуск) возвращает пустой список —
+    чтобы не рассылать уведомления обо всех заменах при старте бота.
+    """
+    current = _replacements_from_schedule(schedule)
+    if not old_fingerprint:
+        return []
+    try:
+        old = {tuple(r) for r in json.loads(old_fingerprint)}
+    except (ValueError, TypeError):
+        old = set()
+    return [r for r in current if tuple(r) not in old]
